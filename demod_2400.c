@@ -257,6 +257,26 @@ static void score_phase(int try_phase, uint16_t *pa, unsigned char **bestmsg, in
     }
 }
 
+// Set bit k of mask[i] when start position 8 * i + k passes the cheap preamble pre-check
+// of demodulate2400(). nbytes must be a multiple of 8.
+static void precheckMask(const uint16_t *m, uint8_t *mask, uint32_t nbytes) {
+    for (uint32_t i = 0; i < nbytes; i += 8) {
+        const uint16_t *p = m + 8 * i;
+        // 64 positions with no branches and no state carried between them: compilers vectorize this at -O2
+        uint8_t pass[64];
+        for (uint32_t j = 0; j < 64; j++) {
+            pass[j] = (p[j + 1] > p[j + 7]) & (p[j + 12] > p[j + 14]) & (p[j + 12] > p[j + 15]);
+        }
+        for (uint32_t k = 0; k < 8; k++) {
+            uint8_t bits = 0;
+            for (uint32_t j = 0; j < 8; j++) {
+                bits |= pass[8 * k + j] << j;
+            }
+            mask[i + k] = bits;
+        }
+    }
+}
+
 //
 // Given 'mlen' magnitude samples in 'm', sampled at 2.4MHz,
 // try to demodulate some Mode S messages.
@@ -297,45 +317,25 @@ void demodulate2400(struct mag_buf *mag) {
     const uint32_t noiseLowThreshold = Modes.noiseLowThreshold * Modes.noiseLowThreshold * statsWindow;
     const uint32_t noiseHighThreshold = Modes.noiseHighThreshold * Modes.noiseHighThreshold * statsWindow;
 
-    // Evaluate the cheap preamble pre-check for every start position up front, as a bitmask
-    // and without branches. On noise it passes for ~1 in 7 positions at random, so testing it
-    // with a branch per position mispredicts most of the time.
-    // The scan below looks at up to 10 positions from any pa < stop (it may run past stop,
-    // the trailing samples make that safe), so positions up to mlen + 9 are needed.
-    // One spare word at the end: the scan always reads the word after the current one.
-    static uint64_t *premask;
-    static uint32_t premaskWords;
-    uint32_t nwords = (mlen + 10 + 63) / 64;
-    if (nwords + 1 > premaskWords) {
+    // On noise the cheap preamble pre-check passes for ~1 in 7 positions at random, so testing it
+    // with a branch per position mispredicts most of the time. Evaluate it for the whole buffer up
+    // front instead, one bit per start position. The scan below reads 3 bytes from (pa - m) / 8
+    // for any pa < stop, so the mask needs mlen / 8 + 3 bytes; filling it reads at most
+    // 94 samples past mlen, well within the trailing samples.
+    static uint8_t *premask;
+    static uint32_t premaskSize;
+    uint32_t nbytes = (mlen / 8 + 3 + 7) & ~7u; // precheckMask() works on 8 bytes at a time
+    if (nbytes > premaskSize) {
         free(premask);
-        premask = cmalloc((nwords + 1) * sizeof(uint64_t));
+        premask = cmalloc(nbytes);
         if (!premask) {
-            // cmalloc() has already scheduled the exit, skip this buffer
-            premaskWords = 0;
-            return;
+            premaskSize = 0;
+            return; // cmalloc() has already scheduled the exit
         }
-        premaskWords = nwords + 1;
+        memset(premask, 0, nbytes); // precheckMask() fills it, but gcc -fanalyzer can't tell
+        premaskSize = nbytes;
     }
-    for (uint32_t w = 0; w < nwords; w++) {
-        const uint16_t *p = m + w * 64;
-        // fixed trip count and no loop-carried state, so compilers vectorize this even at -O2
-        uint8_t pass[64];
-        for (uint32_t j = 0; j < 64; j++) {
-            pass[j] = (p[j + 1] > p[j + 7]) & (p[j + 12] > p[j + 14]) & (p[j + 12] > p[j + 15]);
-        }
-        // pack 8 bytes of 0/1 into 8 bits, byte i -> bit i (needs byte i in the low end of the load)
-        uint64_t bits = 0;
-        for (uint32_t k = 0; k < 8; k++) {
-            uint64_t eight;
-            memcpy(&eight, pass + 8 * k, 8);
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-            eight = __builtin_bswap64(eight);
-#endif
-            bits |= ((eight * 0x0102040810204080ULL) >> 56) << (8 * k);
-        }
-        premask[w] = bits;
-    }
-    premask[nwords] = 0;
+    precheckMask(m, premask, nbytes);
 
     for (; pa < stop; pa++) {
         int32_t pa_mag, base_noise, ref_level;
@@ -365,20 +365,17 @@ void demodulate2400(struct mag_buf *mag) {
             statsProgress = pa + statsWindow;
         }
 
-        // Go to the first passing position among pa .. pa + 9, or, if none passes,
+        // Go to the first of pa .. pa + 9 that passes the pre-check, or, if none does,
         // move on by 10 (9 here plus the loop's pa++).
         {
             uint32_t idx = pa - m;
-            uint32_t b = idx & 63;
-            // bits b .. b + 9, continuing into the next word; (x << 1) << (63 - b) is x << (64 - b)
-            // without the undefined shift by 64 when b == 0
-            uint64_t window = (premask[idx >> 6] >> b) | ((premask[(idx >> 6) + 1] << 1) << (63 - b));
-            window &= 0x3FF;
+            const uint8_t *mb = premask + idx / 8;
+            uint32_t window = ((mb[0] | mb[1] << 8 | mb[2] << 16) >> (idx % 8)) & 0x3FF;
             if (!window) {
                 pa += 9;
                 continue;
             }
-            pa += __builtin_ctzll(window);
+            pa += __builtin_ctz(window);
         }
 
 
