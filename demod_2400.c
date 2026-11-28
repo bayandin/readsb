@@ -262,7 +262,7 @@ static void score_phase(int try_phase, uint16_t *pa, unsigned char **bestmsg, in
 static void precheckMask(const uint16_t *m, uint8_t *mask, uint32_t nbytes) {
     for (uint32_t i = 0; i < nbytes; i += 8) {
         const uint16_t *p = m + 8 * i;
-        // 64 positions with no branches and no state carried between them: compilers vectorize this at -O2
+        // 64 positions with no branches and no state carried between them: compilers vectorize this even at -O2
         uint8_t pass[64];
         for (uint32_t j = 0; j < 64; j++) {
             pass[j] = (p[j + 1] > p[j + 7]) & (p[j + 12] > p[j + 14]) & (p[j + 12] > p[j + 15]);
